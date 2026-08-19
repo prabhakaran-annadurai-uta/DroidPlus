@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "droid-plus"
+version = "0.1.0"
+description = "DROID+ - Franka robot control services, clients, and utilities"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+authors = [
+    {name = "SRL Team"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Robotics",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.0",
+    "requests>=2.31",
+    "numpy",
+    "scipy",
+    "opencv-python",
+    "pyarrow>=14.0.0",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+gripper = [
+    "pyrobotiqgripper>=1.0.0",
+    "minimalmodbus>=2.1",
+    "pyserial>=3.5",
+]
+policy = [
+    "openpi_client",
+    "Pillow",
+    "websockets",
+    "msgpack",
+]
+analysis = [
+    "matplotlib",
+    "pin",
+]
+teleop = [
+    "lerobot[feetech]>=0.4.3,<0.5",
+]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+]
+all = [
+    "droid-plus[gripper,policy,analysis,dev]",
+]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "policy" },
+        { extra = "teleop" },
+    ],
+    [
+        { extra = "all" },
+        { extra = "teleop" },
+    ],
+]
+
+[project.scripts]
+franky-service = "droid_plus.services.franky_service:main"
+camera-service = "droid_plus.services.camera_service:main"
+gripper-service = "droid_plus.services.gripper_service:main"
+export-lerobot = "droid_plus.logging.lerobot_export_cli:main"
+
+[project.urls]
+Repository = "https://github.com/NVlabs/DroidPlus"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["droid_plus*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

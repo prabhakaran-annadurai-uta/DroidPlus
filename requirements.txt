@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Compatibility entry point for users of ``pip install -r requirements.txt``.
+# Dependency versions and groups are defined only in pyproject.toml.
+# ``franky-control`` is intentionally not installed; see README.md.
+-e .[gripper]
+# Robot control remains a separate, user-managed integration.
