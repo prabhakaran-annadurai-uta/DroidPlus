@@ -1,0 +1,44 @@
+[
+    {
+        "experiment": "test",
+        "task": "TestTask", 
+        "instruction": "",
+        "action_step_limit": 1800
+    },
+    {
+        "experiment": "banana_in_bowl",
+        "task": "BananaInBowlTask", 
+        "instruction": "Put the banana in the bowl",
+        "action_step_limit": 900
+    },
+    {
+        "experiment": "bananas_out_of_bin",
+        "task": "BananasOutOfBin", 
+        "instruction": "Take the bananas out of the bin and put it on the table",
+        "action_step_limit": 1800
+    }, 
+    {
+        "experiment": "pick_up_drill",
+        "task": "ToolsPickingDrillTask", 
+        "instruction": "Pick up the drill and drop it in the box",
+        "action_step_limit": 1200
+    }, 
+    {
+        "experiment": "food_packing_2_cans",
+        "task": "FoodPacking2CansTask", 
+        "instruction": "Pack the two cans into the box",
+        "action_step_limit": 1800
+    },
+    {
+        "experiment": "oranges_box",
+        "task": "OrangesIntoBoxTask", 
+        "instruction": "Pick up the oranges and put them into the box",
+        "action_step_limit": 1800
+    },
+    {
+        "experiment": "white_cup_in_middle",
+        "task": "WhiteCupInMiddleTask", 
+        "instruction": "Put the white cup in the middle of the table",
+        "action_step_limit": 1200
+    }
+]
