@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/droid_plus_logo.png" alt="DROID+ logo" width="220">
+</p>
+
 # DROID+
 
 DROID+ is an improved hardware control stack for [DROID](https://droid-dataset.github.io), which contains robot control, camera, and gripper services and clients for the DROID setup.
