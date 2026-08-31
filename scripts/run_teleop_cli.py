@@ -234,7 +234,7 @@ def main() -> None:
         try:
             droid.gripper.shutdown_async()
         except Exception:
-            pass
+            print(f"Gripper movement error : {e}")
 
 
 if __name__ == "__main__":

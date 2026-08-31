@@ -72,7 +72,7 @@ class DroidPlus:
         self.gripper = gripper_client or GripperClient(
             base_url=gripper_service_url or GRIPPER_SERVICE_URL
         )
-
+        print(f"gripper initialized {gripper_client}")
         self.wrist_camera_id = _serial_to_camera_id(wrist_camera_serial)
         self.left_camera_id = _serial_to_camera_id(left_camera_serial)
         self.right_camera_id = _serial_to_camera_id(right_camera_serial)

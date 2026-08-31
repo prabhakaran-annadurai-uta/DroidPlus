@@ -131,6 +131,9 @@ franky_service:
 camera_service:
 	ZED_CAMERA_RESOLUTION=$${ZED_CAMERA_RESOLUTION:-VGA} uvicorn droid_plus.services.camera_service:app --host 0.0.0.0 --port 54322 --workers 1 --no-access-log
 
+realsense_camera_service:
+	uvicorn droid_plus.services.realsense_camera_service:app --host 0.0.0.0 --port 54322 --workers 1 --no-access-log
+
 gripper_service:
 	uvicorn droid_plus.services.gripper_service:app --host 0.0.0.0 --port 54323 --workers 1
 

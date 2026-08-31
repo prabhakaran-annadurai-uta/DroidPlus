@@ -118,8 +118,10 @@ def run_teleop_episode(
             gripper_cmd_frac = last_gripper_cmd_frac
             if gripper_initialized and not session.dry_run:
                 so101_gripper_deg = extract_so101_gripper_deg(action)
+                #print(f"DEBUG Raw action keys {list(action.keys())}")
                 if so101_gripper_deg is not None:
                     robotiq_pos = so101_gripper_to_robotiq(so101_gripper_deg)
+                    #print(f"Leader Arm Out: {so101_gripper_deg:.3f} | Bits: {robotiq_pos} | Last Bits: {last_gripper_pos}")
                     gripper_cmd_frac = float(robotiq_pos) / 255.0
                     if last_gripper_pos is None or abs(robotiq_pos - last_gripper_pos) > 2:
                         try:
