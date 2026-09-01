@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Teleop episode runner: streams SO-101 leader actions to the Franka while
+Teleop episode runner: streams leader-arm actions to the Franka while
 recording observations at a configurable sub-rate.
 
-UI-agnostic — mirrors ``droid_plus.eval.episode_runner.run_episode``. The
-caller supplies a ``should_stop`` callable (KeyPoller closure for CLI,
+UI- and device-agnostic — mirrors ``droid_plus.eval.episode_runner.run_episode``.
+The caller supplies a :class:`~droid_plus.datagen.leader.LeaderArm` (SO-101,
+GELLO, ...), a ``should_stop`` callable (KeyPoller closure for CLI,
 ``threading.Event.is_set`` for the web UI) and constructs the
 ``EpisodeRecorder``.
 """
@@ -17,13 +18,8 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
+from droid_plus.datagen.leader import LeaderArm
 from droid_plus.datagen.safety import DEFAULT_MIN_EE_Z, enforce_min_z
-from droid_plus.datagen.so101 import (
-    action_to_so101_joints_deg,
-    extract_so101_gripper_deg,
-    so101_gripper_to_robotiq,
-    so101_to_franka,
-)
 from droid_plus.eval.episode_runner import EpisodeConfig, EpisodeResult
 from droid_plus.logging import EpisodeRecorder
 from droid_plus.robot.observations import pack_state_action
@@ -60,7 +56,7 @@ def run_teleop_episode(
     config: EpisodeConfig,
     session: TeleopSessionConfig,
     droid: "DroidPlus",
-    teleop: Any,
+    leader: LeaderArm,
     gripper_initialized: bool,
     pin_model: Any,
     pin_data: Any,
@@ -70,7 +66,7 @@ def run_teleop_episode(
 ) -> EpisodeResult:
     """Run a single teleop episode.
 
-    Streams SO-101 leader actions to the Franka at ``session.rate_hz``, with
+    Streams leader-arm joint targets to the Franka at ``session.rate_hz``, with
     FK-based table-safety clamping. Records images + state/action at the
     configured sub-rate. Returns an :class:`EpisodeResult` with the recorder
     **un-finalized** (the caller finalizes after collecting labels).
@@ -82,7 +78,13 @@ def run_teleop_episode(
     rec_seq = 0
     last_gripper_pos: int | None = None
     last_gripper_cmd_frac: float = 0.0
-    q_prev_safe = np.array(HOME_POSITION, dtype=float)
+
+    # Seed the safety fallback from where the robot actually is: enforce_min_z
+    # reverts to this pose, so a stale value would command a large step.
+    try:
+        q_prev_safe = np.asarray(droid.get_current_joint_state()["positions"], dtype=float)
+    except Exception:
+        q_prev_safe = np.array(HOME_POSITION, dtype=float)
 
     step_limit = config.action_step_limit if config.action_step_limit > 0 else None
 
@@ -101,10 +103,8 @@ def run_teleop_episode(
 
             t0 = time.time()
 
-            action = teleop.get_action()
-            so_deg = action_to_so101_joints_deg(action)
-            so_rad = np.deg2rad(so_deg)
-            q_franka = so101_to_franka(so_rad)
+            command = leader.read()
+            q_franka = np.asarray(command.q_franka, dtype=float)
 
             q_franka, _ = enforce_min_z(
                 q_franka, q_prev_safe, pin_model, pin_data, ee_frame, session.min_z,
@@ -116,20 +116,16 @@ def run_teleop_episode(
 
             # Gripper — continuous mapping with a bits-delta gate to avoid spam.
             gripper_cmd_frac = last_gripper_cmd_frac
-            if gripper_initialized and not session.dry_run:
-                so101_gripper_deg = extract_so101_gripper_deg(action)
-                #print(f"DEBUG Raw action keys {list(action.keys())}")
-                if so101_gripper_deg is not None:
-                    robotiq_pos = so101_gripper_to_robotiq(so101_gripper_deg)
-                    #print(f"Leader Arm Out: {so101_gripper_deg:.3f} | Bits: {robotiq_pos} | Last Bits: {last_gripper_pos}")
-                    gripper_cmd_frac = float(robotiq_pos) / 255.0
-                    if last_gripper_pos is None or abs(robotiq_pos - last_gripper_pos) > 2:
-                        try:
-                            droid.gripper.go_to_async(robotiq_pos, wait=False)
-                            last_gripper_pos = robotiq_pos
-                        except Exception:
-                            pass
-                    last_gripper_cmd_frac = gripper_cmd_frac
+            if gripper_initialized and not session.dry_run and command.gripper_bits is not None:
+                robotiq_pos = int(command.gripper_bits)
+                gripper_cmd_frac = float(robotiq_pos) / 255.0
+                if last_gripper_pos is None or abs(robotiq_pos - last_gripper_pos) > 2:
+                    try:
+                        droid.gripper.go_to_async(robotiq_pos, wait=False)
+                        last_gripper_pos = robotiq_pos
+                    except Exception:
+                        pass
+                last_gripper_cmd_frac = gripper_cmd_frac
 
             # Sub-rate recording.
             if recorder is not None and session.record and seq % record_every_n == 0:

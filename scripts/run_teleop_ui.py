@@ -2,14 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Web UI teleop runner — browser interface for SO-101 teleop episodes.
+Web UI teleop runner — browser interface for leader-arm teleop episodes.
 
-Parallels ``scripts/run_experiment_ui.py`` but for data-generation. The
-SO-101 leader arm is connected at launch; each episode is started/stopped
+Parallels ``scripts/run_experiment_ui.py`` but for data-generation. The leader
+arm (SO-101 or GELLO) is connected at launch; each episode is started/stopped
 from the browser (Enter / Esc, or the terminal's ESC key).
 
 Usage:
     python scripts/run_teleop_ui.py
+    python scripts/run_teleop_ui.py --leader gello
     python scripts/run_teleop_ui.py --port /dev/ttyACM1
     python scripts/run_teleop_ui.py --no-gripper --web-port 54325
 """
@@ -30,14 +31,18 @@ from fastapi.responses import HTMLResponse
 from droid_plus.analysis.end_effector_pose import compute_and_save_ee_trajectory_single
 from droid_plus.constants import FRANKY_SERVICE_URL, RECORD_JPEG_QUALITY
 from droid_plus.datagen import (
+    DEFAULT_LEADER_PORTS,
     DEFAULT_MIN_EE_Z,
+    LEADER_KINDS,
+    LeaderArm,
     TeleopSessionConfig,
     build_fk_model,
-    connect_so101,
+    connect_leader,
     finalize_teleop_episode_recording,
     init_gripper,
     make_teleop_run_dir,
     run_teleop_episode,
+    wait_for_alignment,
 )
 from droid_plus.eval.episode_runner import EpisodeConfig, EpisodeResult
 from droid_plus.eval.experiment_setup import wait_for_cameras
@@ -65,21 +70,25 @@ class EpisodeHistory:
 @dataclass
 class AppState:
     droid: DroidPlus
-    teleop: Any
+    leader: LeaderArm
     gripper_initialized: bool
     pin_model: Any
     pin_data: Any
     ee_frame: str
     session: TeleopSessionConfig
-    so101_port: str
+    leader_kind: str
+    leader_port: str
     base_run_dir: str | None
+    align_tol_rad: float = 0.25
+    align_check: bool = True
+    notes: str = ""
     # Episode control
     episode_idx: int = 0
     episode_thread: threading.Thread | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     current_result: EpisodeResult | None = None
     current_config: EpisodeConfig | None = None
-    status: str = "idle"  # "idle" | "running"
+    status: str = "idle"  # "idle" | "aligning" | "running"
     t_start: float = 0.0
     history: list[EpisodeHistory] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -88,6 +97,22 @@ class AppState:
 def _run_episode_thread(state: AppState) -> None:
     """Background thread that runs a single teleop episode."""
     try:
+        if state.align_check and not state.session.dry_run:
+            with state.lock:
+                state.status = "aligning"
+            aligned = wait_for_alignment(
+                state.leader,
+                state.droid,
+                tol_rad=state.align_tol_rad,
+                should_stop=state.stop_event.is_set,
+            )
+            if not aligned:
+                with state.lock:
+                    state.status = "idle"
+                return
+            with state.lock:
+                state.status = "running"
+
         recorder: EpisodeRecorder | None = None
         if state.session.record and state.base_run_dir is not None:
             recorder = EpisodeRecorder(
@@ -101,7 +126,7 @@ def _run_episode_thread(state: AppState) -> None:
             config=state.current_config,
             session=state.session,
             droid=state.droid,
-            teleop=state.teleop,
+            leader=state.leader,
             gripper_initialized=state.gripper_initialized,
             pin_model=state.pin_model,
             pin_data=state.pin_data,
@@ -122,7 +147,7 @@ def _run_episode_thread(state: AppState) -> None:
             try:
                 compute_and_save_ee_trajectory_single(
                     episode_dir=result.recorder.episode_dir,
-                    overwrite=False,
+                    overwrite=True,
                     verbose=True,
                 )
             except Exception as e:
@@ -247,8 +272,8 @@ LANDING_PAGE_HTML = """<!doctype html>
       <div class="card-label">Teleop</div>
       <div class="field-grid">
         <div class="field-cell">
-          <label>SO-101 port <span class="hint">set at launch with <code>--port</code></span></label>
-          <div class="field-readonly" id="so101_port">—</div>
+          <label>Leader <span class="hint">set at launch with <code>--leader</code> / <code>--port</code></span></label>
+          <div class="field-readonly" id="leader_info">—</div>
         </div>
         <div class="field-cell">
           <label>Gripper</label>
@@ -318,7 +343,7 @@ LANDING_PAGE_HTML = """<!doctype html>
     const episodeIdxEl = document.getElementById("episode_idx");
     const statusArea = document.getElementById("status_area");
     const historyList = document.getElementById("history_list");
-    const so101PortEl = document.getElementById("so101_port");
+    const so101PortEl = document.getElementById("leader_info");
     const gripperStatusEl = document.getElementById("gripper_status");
     const rateHzEl = document.getElementById("rate_hz");
     const recordRateHzEl = document.getElementById("record_rate_hz");
@@ -360,7 +385,7 @@ LANDING_PAGE_HTML = """<!doctype html>
         const r = await fetch("/config");
         const d = await r.json();
         configRateHz = d.rate_hz;
-        so101PortEl.textContent = d.so101_port || "—";
+        so101PortEl.textContent = d.leader || "—";
         gripperStatusEl.textContent = d.gripper_initialized ? "initialized" : "disabled";
         rateHzEl.textContent = d.rate_hz;
         recordRateHzEl.textContent = d.record_rate_hz;
@@ -392,27 +417,31 @@ LANDING_PAGE_HTML = """<!doctype html>
     function updateUI(s) {
       currentStatus = s.status;
       episodeIdxEl.textContent = s.episode_idx;
+      const busy = (s.status === "running" || s.status === "aligning");
 
-      if (s.status === "running") {
+      if (busy) {
         badgeEl.className = "badge badge-running pulse";
-        badgeEl.textContent = "running";
+        badgeEl.textContent = s.status;
       } else {
         badgeEl.className = "badge badge-idle";
         badgeEl.textContent = "idle";
       }
 
-      const disabled = (s.status === "running");
+      const disabled = busy;
       instructionEl.disabled = disabled;
       experimentEl.disabled = disabled;
       taskEl.disabled = disabled;
       walltimeEl.disabled = disabled;
       minZEl.disabled = disabled;
 
-      if (s.status === "running") {
+      if (busy) {
         const elapsed = ((Date.now() / 1000) - s.t_start).toFixed(1);
+        const heading = s.status === "aligning"
+          ? "Match the leader arm to the robot pose..."
+          : "Teleop active...";
         statusArea.innerHTML = `
           <div class="status-running">
-            <div class="status-text pulse">Teleop active...</div>
+            <div class="status-text pulse">${heading}</div>
             <div class="status-detail">
               Episode ${s.episode_idx} &middot;
               "${escHtml(s.instruction)}" &middot;
@@ -574,7 +603,7 @@ LANDING_PAGE_HTML = """<!doctype html>
     }
 
     async function startEpisode() {
-      if (currentStatus === "running") return;
+      if (currentStatus !== "idle") return;
       const instruction = instructionEl.value.trim();
       const walltimeRaw = walltimeEl.value.trim();
       let actionStepLimit = -1;
@@ -604,7 +633,7 @@ LANDING_PAGE_HTML = """<!doctype html>
     }
 
     async function stopEpisode() {
-      if (currentStatus !== "running") return;
+      if (currentStatus === "idle") return;
       try { await fetch("/episode/stop", {method: "POST"}); } catch(e) {}
     }
 
@@ -650,7 +679,9 @@ def get_config():
         "min_z": s.session.min_z,
         "record": s.session.record,
         "dry_run": s.session.dry_run,
-        "so101_port": s.so101_port,
+        "leader": f"{s.leader_kind} @ {s.leader_port}",
+        "leader_kind": s.leader_kind,
+        "leader_port": s.leader_port,
         "gripper_initialized": s.gripper_initialized,
         "base_run_dir": s.base_run_dir,
     }
@@ -668,8 +699,8 @@ def set_min_z(body: dict):
     except (TypeError, ValueError):
         raise HTTPException(400, "min_z must be a number")
     with s.lock:
-        if s.status == "running":
-            raise HTTPException(409, "cannot change min_z while running")
+        if s.status != "idle":
+            raise HTTPException(409, "cannot change min_z while an episode is active")
         # TeleopSessionConfig is frozen — rebuild with the new value.
         s.session = replace(s.session, min_z=new_min_z)
     return {"ok": True, "min_z": new_min_z}
@@ -716,17 +747,18 @@ def episode_start(body: dict):
         action_step_limit = -1
 
     with s.lock:
-        if s.status == "running":
-            raise HTTPException(409, "episode already running")
+        if s.status != "idle":
+            raise HTTPException(409, f"episode already {s.status}")
 
         config = EpisodeConfig(
             instruction=instruction,
             task=task,
             action_step_limit=action_step_limit,
             experiment=experiment,
+            notes=s.notes,
         )
         s.current_config = config
-        s.status = "running"
+        s.status = "aligning" if (s.align_check and not s.session.dry_run) else "running"
         s.t_start = time.time()
         s.stop_event.clear()
         s.current_result = None
@@ -815,26 +847,41 @@ def episode_label(body: dict):
 def main() -> None:
     global _state
 
-    p = argparse.ArgumentParser(description="Web UI for SO-101 teleop data collection")
+    p = argparse.ArgumentParser(description="Web UI for leader-arm teleop data collection")
     p.add_argument("--web-port", type=int, default=DEFAULT_PORT,
         help=f"Web server port (default: {DEFAULT_PORT})")
-    p.add_argument("--port", default="/dev/ttyACM0", help="SO-101 leader serial port")
+    p.add_argument("--leader", choices=LEADER_KINDS, default="so101",
+        help="Leader device (default: so101)")
+    p.add_argument("--port", default=None,
+        help="Leader serial port (default: /dev/ttyACM0 for so101, /dev/ttyUSB0 for gello)")
+    p.add_argument("--gello-config", default=None,
+        help="Path to a GELLO calibration JSON (see scripts/gello_calibrate.py); "
+             "falls back to $GELLO_CONFIG, then built-in Franka GELLO defaults")
+    p.add_argument("--gello-max-speed", type=float, default=None,
+        help="GELLO command slew limit (rad/s); <=0 disables rate limiting")
+    p.add_argument("--align-tol", type=float, default=0.25,
+        help="Max per-joint leader/robot mismatch (rad) tolerated before an episode starts")
+    p.add_argument("--no-align-check", action="store_true",
+        help="Skip the pre-episode leader/robot pose alignment gate")
     p.add_argument("--franky-service-url", default=FRANKY_SERVICE_URL,
         help="Franky service URL (used for URDF fetch)")
     p.add_argument("--no-gripper", action="store_true", help="Skip gripper initialization")
     p.add_argument("--rate-hz", type=float, default=100.0, help="Control loop rate (Hz)")
     p.add_argument("--min-z", type=float, default=DEFAULT_MIN_EE_Z,
         help=f"Min EE Z height (m) — table safety (default: {DEFAULT_MIN_EE_Z})")
-    p.add_argument("--record", default=True, action="store_true", help="Record episodes")
+    p.add_argument("--no-record", action="store_true", help="Disable data recording")
     p.add_argument("--record-rate-hz", type=float, default=15.0, help="Recording rate (Hz)")
     p.add_argument("--record-jpeg-quality", type=int, default=RECORD_JPEG_QUALITY,
         help=f"JPEG quality for recorded images (default: {RECORD_JPEG_QUALITY})")
     p.add_argument("--jpeg-quality", type=int, default=90, help="JPEG quality for camera snapshots")
     p.add_argument("--output-dir", default="output", help="Base output directory for recordings")
     p.add_argument("--task", default="", help="Task name (used for the run directory)")
+    p.add_argument("--notes", default="", help="Free-form notes (recorded in meta.json)")
     p.add_argument("--dry-run", action="store_true",
-        help="Read SO-101 but do not command the robot or gripper")
+        help="Read the leader but do not command the robot or gripper")
     args = p.parse_args()
+
+    leader_port = args.port or DEFAULT_LEADER_PORTS[args.leader]
 
     session = TeleopSessionConfig(
         rate_hz=float(args.rate_hz),
@@ -843,7 +890,8 @@ def main() -> None:
         record_jpeg_quality=int(args.record_jpeg_quality),
         min_z=float(args.min_z),
         dry_run=bool(args.dry_run),
-        record=bool(args.record),
+        record=not args.no_record,
+        policy_name=f"teleop_{args.leader}",
     )
 
     print("Initializing robot...")
@@ -864,7 +912,13 @@ def main() -> None:
         reason = "dry-run" if args.dry_run else "--no-gripper"
         print(f"Skipping gripper initialization ({reason}).")
 
-    teleop = connect_so101(args.port, settle_s=2.0 if gripper_initialized else 0.0)
+    leader = connect_leader(
+        args.leader,
+        leader_port,
+        settle_s=2.0 if gripper_initialized else 0.0,
+        gello_config_path=args.gello_config,
+        gello_max_joint_speed_rad_s=args.gello_max_speed,
+    )
 
     base_run_dir: str | None = None
     if session.record:
@@ -872,23 +926,28 @@ def main() -> None:
 
     _state = AppState(
         droid=droid,
-        teleop=teleop,
+        leader=leader,
         gripper_initialized=gripper_initialized,
         pin_model=pin_model,
         pin_data=pin_data,
         ee_frame=ee_frame,
         session=session,
-        so101_port=args.port,
+        leader_kind=args.leader,
+        leader_port=leader_port,
         base_run_dir=base_run_dir,
+        align_tol_rad=float(args.align_tol),
+        align_check=not args.no_align_check,
+        notes=args.notes,
     )
 
     print("\n  teleop_service")
     print(f"    UI:            http://localhost:{args.web_port}")
-    print(f"    SO-101:        {args.port}")
+    print(f"    Leader:        {args.leader} on {leader_port}")
     print(f"    Gripper:       {'initialized' if gripper_initialized else 'disabled'}")
     print(f"    Control rate:  {session.rate_hz} Hz")
     print(f"    Record rate:   {session.record_rate_hz} Hz")
     print(f"    Record:        {base_run_dir or 'disabled'}")
+    print(f"    Align gate:    {'off' if args.no_align_check else f'{args.align_tol} rad'}")
     print(f"    Dry run:       {session.dry_run}")
     print("\n  Terminal: ESC to stop episode, Ctrl+C to quit.\n")
 
@@ -903,18 +962,19 @@ def main() -> None:
         with KeyPoller() as keys:
             while True:
                 ch = keys.poll_char()
-                if ch == "\x1b" and _state.status == "running":
+                if ch == "\x1b" and _state.status != "idle":
                     print("\n[terminal] ESC → stopping episode...")
                     _state.stop_event.set()
                 if ch is None:
                     time.sleep(0.05)
     except KeyboardInterrupt:
         print("\nShutting down...")
-        if _state and _state.status == "running":
+        if _state and _state.status != "idle":
             _state.stop_event.set()
             if _state.episode_thread:
                 _state.episode_thread.join(timeout=5)
 
+    leader.close()
     if gripper_initialized:
         try:
             droid.gripper.shutdown_async()

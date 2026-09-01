@@ -1,0 +1,29 @@
+{
+  "port": "/dev/ttyUSB0",
+  "baudrate": 57600,
+  "joint_signs": [
+    1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    1
+  ],
+  "joint_offsets": [
+    0.0,
+    0.0,
+    0.0,
+    1.571,
+    1.571,
+    3.142,
+    4.712
+  ],
+  "gripper": true,
+  "gripper_range_rad": [
+    2.158,
+    3.378
+  ],
+  "max_joint_speed_rad_s": 2.0,
+  "smoothing_alpha": 0.85
+}

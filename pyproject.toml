@@ -56,13 +56,16 @@ analysis = [
 teleop = [
     "lerobot[feetech]>=0.4.3,<0.5",
 ]
+gello = [
+    "dynamixel-sdk>=3.7.31",
+]
 dev = [
     "pytest",
     "ruff",
     "mypy",
 ]
 all = [
-    "droid-plus[gripper,policy,analysis,dev]",
+    "droid-plus[gripper,policy,analysis,gello,dev]",
 ]
 
 [tool.uv]

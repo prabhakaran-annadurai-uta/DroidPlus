@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Teleop session bootstrap: FK model, SO-101 leader connection, run dir.
+Teleop session bootstrap: FK model, leader-arm connection, run dir.
 
 Parallels ``droid_plus.eval.experiment_setup`` but for data-generation flows.
 """
@@ -13,8 +13,11 @@ from typing import TYPE_CHECKING, Any
 
 from droid_plus.analysis.end_effector_pose import build_model_from_urdf, get_urdf
 from droid_plus.constants import FRANKY_SERVICE_URL
+from droid_plus.datagen.gello import DEFAULT_GELLO_PORT
+from droid_plus.datagen.leader import LEADER_KINDS, LeaderArm, So101Leader
 
 if TYPE_CHECKING:
+    from droid_plus.datagen.gello import GelloLeader
     from droid_plus.robot import DroidPlus
 
 
@@ -57,7 +60,10 @@ def init_gripper(droid: "DroidPlus") -> bool:
         return False
 
 
-# ── SO-101 ───────────────────────────────────────────────────────────────────
+# ── Leader arms ──────────────────────────────────────────────────────────────
+
+DEFAULT_LEADER_PORTS = {"so101": "/dev/ttyACM0", "gello": DEFAULT_GELLO_PORT}
+
 
 def connect_so101(port: str = "/dev/ttyACM0", *, id: str = "main_leader", settle_s: float = 2.0) -> Any:
     """Connect to the SO-101 leader arm.
@@ -79,6 +85,54 @@ def connect_so101(port: str = "/dev/ttyACM0", *, id: str = "main_leader", settle
     teleop.connect()
     print("SO-101 connected successfully")
     return teleop
+
+
+def connect_gello(
+    port: str | None = None,
+    *,
+    config_path: str | None = None,
+    max_joint_speed_rad_s: float | None = None,
+    settle_s: float = 0.0,
+) -> "GelloLeader":
+    """Connect to a 7-DoF GELLO leader arm."""
+    from droid_plus.datagen.gello import GelloLeader, load_gello_config
+
+    if settle_s > 0:
+        print(f"Waiting {settle_s}s before initializing GELLO...")
+        time.sleep(settle_s)
+
+    config = load_gello_config(
+        config_path, port=port, max_joint_speed_rad_s=max_joint_speed_rad_s
+    )
+    print(f"Connecting to GELLO on {config.port}...")
+    leader = GelloLeader(config)
+    print(f"GELLO connected successfully (slew limit {config.max_joint_speed_rad_s} rad/s, "
+          f"gripper {'on' if config.gripper else 'off'})")
+    return leader
+
+
+def connect_leader(
+    kind: str,
+    port: str | None = None,
+    *,
+    settle_s: float = 0.0,
+    gello_config_path: str | None = None,
+    gello_max_joint_speed_rad_s: float | None = None,
+) -> LeaderArm:
+    """Connect the requested leader device and return it as a ``LeaderArm``."""
+    kind = kind.strip().lower()
+    if kind not in LEADER_KINDS:
+        raise ValueError(f"Unknown leader {kind!r}; expected one of {LEADER_KINDS}")
+
+    if kind == "so101":
+        return So101Leader(connect_so101(port or DEFAULT_LEADER_PORTS["so101"], settle_s=settle_s))
+
+    return connect_gello(
+        port,
+        config_path=gello_config_path,
+        max_joint_speed_rad_s=gello_max_joint_speed_rad_s,
+        settle_s=settle_s,
+    )
 
 
 # ── Run directory ────────────────────────────────────────────────────────────

@@ -12,9 +12,13 @@ import numpy as np
 
 from droid_plus.analysis.end_effector_pose import compute_ee_pose
 
-# Minimum allowed EE Z height (metres, in robot base frame). Tune to sit just
-# above the table surface.
-DEFAULT_MIN_EE_Z = 0.05
+# Minimum allowed link8 (flange) Z height in the robot base frame, metres.
+# The served URDF is arm-only, so FK cannot see the gripper: this value must
+# absorb the flange-to-fingertip length. 0.115 was measured by hand-guiding the
+# FR3 until the Franka Hand fingertips contacted the table (link8 z = 0.1146),
+# so it permits touching the surface but not pressing into it. Re-measure for a
+# different end-effector or table height.
+DEFAULT_MIN_EE_Z = 0.115
 
 
 def enforce_min_z(
