@@ -80,12 +80,23 @@ def run_teleop_episode(
 
     # Franka Hand can't be streamed a continuous width like a Robotiq — every
     # move()/grasp() is a discrete command that libfranka rejects while another
-    # is running, and move() throws once the fingers hit an object. So drive it
-    # with an open/close *intent* latched through a hysteresis band: one command
-    # per gesture, grasp() (force-controlled) for closing, move() for opening.
-    GRIPPER_CLOSE_ON = 0.60   # leader closed-fraction that latches a grasp
-    GRIPPER_OPEN_ON = 0.40    # leader closed-fraction that latches an open
-    gripper_intent: str | None = None  # "open" | "close"
+    # runs, and move() throws once the fingers hit an object. Hybrid scheme:
+    #   trigger < GRASP_OFF ......... proportional move() to the mapped width
+    #                                 (approach / hover / release to a gap)
+    #   trigger >= GRASP_ON ......... latch a force-controlled grasp()
+    #   GRASP_OFF..GRASP_ON ......... hysteresis band, hold whatever we're doing
+    # The pre-grasp trigger travel [0, GRASP_OFF] is rescaled to the full width
+    # range so the whole finger span is reachable before the grasp latches.
+    GRIPPER_GRASP_ON = 0.70        # closed-fraction that latches a grasp
+    GRIPPER_GRASP_OFF = 0.55       # closed-fraction that drops back to move()
+    GRIPPER_MOVE_DEADBAND = 0.05   # min frac change before re-sending a move()
+    GRIPPER_MIN_CMD_INTERVAL_S = 0.15
+    # Grasp force, in client "bits" (255 -> ~50 N). ~90 -> ~18 N: gentle enough
+    # for a sponge without crushing it. Raise for heavier / more slippery objects.
+    GRIPPER_GRASP_FORCE_BITS = 90
+    gripper_grasping = False
+    last_move_frac: float | None = None
+    last_gripper_cmd_t = 0.0
 
     # Seed the safety fallback from where the robot actually is: enforce_min_z
     # reverts to this pose, so a stale value would command a large step.
@@ -122,27 +133,37 @@ def run_teleop_episode(
             if not session.dry_run:
                 droid.set_target_joint_state(q_franka, velocities=[0.0] * 7, seq=seq)
 
-            # Gripper — latch an open/close intent and fire one command per flip.
+            # Gripper — proportional move() below the band, force grasp() above it.
             gripper_cmd_frac = last_gripper_cmd_frac
             if gripper_initialized and not session.dry_run and command.gripper_bits is not None:
                 close_frac = float(command.gripper_bits) / 255.0  # 0 = open, 1 = closed
                 gripper_cmd_frac = close_frac
 
-                desired = gripper_intent
-                if close_frac >= GRIPPER_CLOSE_ON:
-                    desired = "close"
-                elif close_frac <= GRIPPER_OPEN_ON:
-                    desired = "open"
-
-                if desired is not None and desired != gripper_intent:
+                if not gripper_grasping and close_frac >= GRIPPER_GRASP_ON:
                     try:
-                        if desired == "close":
-                            droid.gripper.close_async(wait=False)
-                        else:
-                            droid.gripper.open_async(wait=False)
-                        gripper_intent = desired
+                        droid.gripper.close_async(force=GRIPPER_GRASP_FORCE_BITS, wait=False)
+                        gripper_grasping = True
+                        last_move_frac = None
+                        last_gripper_cmd_t = t0
                     except Exception as e:
                         print(f"[gripper] {type(e).__name__}: {e}")
+                elif gripper_grasping and close_frac <= GRIPPER_GRASP_OFF:
+                    gripper_grasping = False
+                    last_move_frac = None  # reposition on the next eligible tick
+
+                if not gripper_grasping:
+                    move_frac = min(close_frac / GRIPPER_GRASP_OFF, 1.0)
+                    moved_enough = (
+                        last_move_frac is None
+                        or abs(move_frac - last_move_frac) >= GRIPPER_MOVE_DEADBAND
+                    )
+                    if moved_enough and (t0 - last_gripper_cmd_t) >= GRIPPER_MIN_CMD_INTERVAL_S:
+                        try:
+                            droid.gripper.go_to_async(int(round(move_frac * 255)), wait=False)
+                            last_move_frac = move_frac
+                            last_gripper_cmd_t = t0
+                        except Exception as e:
+                            print(f"[gripper] {type(e).__name__}: {e}")
                 last_gripper_cmd_frac = gripper_cmd_frac
 
             # Sub-rate recording.
