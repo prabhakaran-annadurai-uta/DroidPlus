@@ -221,3 +221,6 @@ __marimo__/
 # Observation files and scrap scripts
 scripts/observations/
 scripts/scrap.py
+
+# Teleop timing debug captures
+teleop_debug/
