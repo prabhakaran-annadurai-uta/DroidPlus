@@ -19,8 +19,14 @@ Example client:
 
 Env:
   FRANKY_ROBOT_IP=<robot-ip-or-hostname>
-  CONTROL_HZ=50
-  COMMAND_TIMEOUT_S=0.5
+  CONTROL_HZ=100
+  CONTROL_MODE=velocity             # velocity (default, smooth streaming) | position (scripted P2P)
+  VEL_GAIN=4.0                      # velocity mode: rad/s command per rad of position error
+  VEL_CLAMP=1.5                     # velocity mode: per-joint command clamp (rad/s)
+  VEL_WATCHDOG_MS=100               # velocity mode: command decays to 0 if not refreshed within this
+  RELATIVE_DYNAMICS=0.3,0.2,0.1     # (velocity, acceleration, jerk) factors
+  CONTROL_DEADBAND_RAD=0.01         # position mode: re-issue move() only when a joint target moves more than this
+  COMMAND_TIMEOUT_S=10.0
   ALLOWED_CLIENT_IP=<client-ip>      # optional allowlist (direct-connect only)
 """
 
@@ -53,7 +59,17 @@ LOG = logging.getLogger("franky_service")
 
 # CONSTANTS
 N_JOINTS = 7
-DEFAULT_CONTROL_HZ = 50
+DEFAULT_CONTROL_HZ = 100
+# "velocity": JointVelocityMotion P+feed-forward controller. Smooth for streamed teleop targets.
+# "position": JointMotion position waypoints re-issued per tick. Preempts Ruckig every tick and
+#             trips joint_motion_generator discontinuity reflexes on fast targets -- kept for
+#             scripted point-to-point use only, not streaming.
+DEFAULT_CONTROL_MODE = "velocity"
+DEFAULT_CONTROL_DEADBAND_RAD = 0.01  # position mode: only re-issue robot.move() when a joint target moved more than this
+DEFAULT_RELATIVE_DYNAMICS = (0.3, 0.2, 0.1)  # (velocity, acceleration, jerk) factors; jerk 0.1 is very low
+DEFAULT_VEL_GAIN = 4.0              # velocity mode: rad/s of command per rad of position error
+DEFAULT_VEL_CLAMP = 1.5            # velocity mode: per-joint command clamp (rad/s, before relative_dynamics scaling)
+DEFAULT_VEL_WATCHDOG_MS = 100      # velocity mode: JointVelocityMotion duration; decays to 0 if not refreshed
 DEFAULT_COMMAND_TIMEOUT_S = 10.0
 DEFAULT_ALLOWED_CLIENT_IP = ""
 DEFAULT_FRANKY_ROBOT_IP = "localhost"
@@ -525,6 +541,17 @@ def _get_env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _get_env_rdf(name: str, default: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Read a 'velocity,acceleration,jerk' relative-dynamics triple from an env var."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    parts = [float(x) for x in raw.replace(" ", "").split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"{name} must be 'vel,accel,jerk' (got {raw!r})")
+    return (parts[0], parts[1], parts[2])
+
+
 def _validate_vec(name: str, values: list[float], n: int = N_JOINTS) -> None:
     """Validate a numeric vector payload."""
     if len(values) != n:
@@ -588,6 +615,13 @@ class AppState:
     control_thread: threading.Thread | None
     last_control_error: str | None
     command_timeout_s: float
+    control_hz: int = DEFAULT_CONTROL_HZ
+    control_mode: str = DEFAULT_CONTROL_MODE
+    control_deadband_rad: float = DEFAULT_CONTROL_DEADBAND_RAD
+    relative_dynamics: tuple[float, float, float] = DEFAULT_RELATIVE_DYNAMICS
+    vel_gain: float = DEFAULT_VEL_GAIN
+    vel_clamp: float = DEFAULT_VEL_CLAMP
+    vel_watchdog_ms: int = DEFAULT_VEL_WATCHDOG_MS
 
 
 # INTERNAL FUNCTIONS
@@ -620,12 +654,31 @@ def _try_recover_from_errors(*, st: AppState, context: str, exc: Exception | Non
 
 
 def _control_loop(*, st: AppState, control_hz: int, timeout_s: float) -> None:
-    """Apply latest target at a fixed rate using Franky JointMotion(JointState(...))."""
+    """Stream the latest joint target to the robot at a fixed rate.
+
+    CONTROL_MODE:
+      position  franky.JointMotion(JointState(pos)) re-issued on target change (deadband-gated).
+                Every re-issue preempts Ruckig; fast targets trip the
+                joint_motion_generator velocity/acceleration-discontinuity reflex.
+      velocity  franky.JointVelocityMotion(dq), dq = ff(d/dt target) + gain*(target - measured).
+                No rest-to-rest replanning; velocity-continuous across ticks.
+                vel_watchdog_ms is a dead-man timer (velocity decays to 0 if not refreshed).
+    """
     period_s = 1.0 / float(control_hz)
+    deadband = st.control_deadband_rad
+    mode = st.control_mode
+    gain = st.vel_gain
+    vclamp = st.vel_clamp
+    watchdog = franky.Duration(st.vel_watchdog_ms)
 
     robot = st.robot
     assert robot is not None
     robot.recover_from_errors()
+
+    last_sent: list[float] | None = None       # position mode
+    q_tgt_prev: np.ndarray | None = None       # velocity mode
+    t_prev: float | None = None
+    dq_ff = np.zeros(N_JOINTS)
 
     while not st.shutdown.is_set():
         time.sleep(period_s)
@@ -636,6 +689,8 @@ def _control_loop(*, st: AppState, control_hz: int, timeout_s: float) -> None:
             timeout_s = st.command_timeout_s
 
         if stop_latched or latest is None:
+            last_sent = None
+            q_tgt_prev = None
             continue
 
         age_s = time.time() - latest.accepted_timestamp_s
@@ -649,20 +704,40 @@ def _control_loop(*, st: AppState, control_hz: int, timeout_s: float) -> None:
                 with st.lock:
                     st.stop_latched = True
                     st.latest_target = None
+                last_sent = None
+                q_tgt_prev = None
             continue
 
         try:
-            target = franky.JointState(latest.positions, latest.velocities)
-            # Keep holding the last target until preempted (better streaming behavior).
-            motion = franky.JointMotion(target)
-            robot.move(motion, asynchronous=True)
+            if mode == "velocity":
+                q_now = np.asarray(robot.current_joint_positions, float)
+                q_tgt = np.asarray(latest.positions, float)
+                now = time.monotonic()
+                if q_tgt_prev is not None and t_prev is not None and (now - t_prev) > 1e-4:
+                    v_raw = (q_tgt - q_tgt_prev) / (now - t_prev)
+                    dq_ff = 0.5 * v_raw + 0.5 * dq_ff
+                q_tgt_prev = q_tgt
+                t_prev = now
+                dq_cmd = np.clip(dq_ff + gain * (q_tgt - q_now), -vclamp, vclamp)
+                robot.move(franky.JointVelocityMotion(dq_cmd, duration=watchdog), asynchronous=True)
+            else:
+                # position mode: only preempt when the target actually moved
+                if last_sent is not None:
+                    delta = max(abs(a - b) for a, b in zip(latest.positions, last_sent))
+                    if delta <= deadband:
+                        continue
+                target = franky.JointState(latest.positions, latest.velocities)
+                robot.move(franky.JointMotion(target), asynchronous=True)
+                last_sent = list(latest.positions)
             st.last_control_error = None
         except Exception as e:
             st.last_control_error = f"{type(e).__name__}: {e}"
-            _try_recover_from_errors(st=st, context="move_joint_motion", exc=e)
+            _try_recover_from_errors(st=st, context=f"move_{mode}", exc=e)
             with st.lock:
                 st.stop_latched = True
                 st.latest_target = None
+            last_sent = None
+            q_tgt_prev = None
 
 
 @asynccontextmanager
@@ -672,6 +747,12 @@ async def _lifespan(app: FastAPI):
 
     robot_ip = os.getenv("FRANKY_ROBOT_IP", DEFAULT_FRANKY_ROBOT_IP)
     control_hz = _get_env_int("CONTROL_HZ", DEFAULT_CONTROL_HZ)
+    control_mode = os.getenv("CONTROL_MODE", DEFAULT_CONTROL_MODE).strip().lower() or DEFAULT_CONTROL_MODE
+    deadband = _get_env_float("CONTROL_DEADBAND_RAD", DEFAULT_CONTROL_DEADBAND_RAD)
+    rdf = _get_env_rdf("RELATIVE_DYNAMICS", DEFAULT_RELATIVE_DYNAMICS)
+    vel_gain = _get_env_float("VEL_GAIN", DEFAULT_VEL_GAIN)
+    vel_clamp = _get_env_float("VEL_CLAMP", DEFAULT_VEL_CLAMP)
+    vel_watchdog_ms = _get_env_int("VEL_WATCHDOG_MS", DEFAULT_VEL_WATCHDOG_MS)
     timeout_s = _get_env_float("COMMAND_TIMEOUT_S", DEFAULT_COMMAND_TIMEOUT_S)
 
     st = AppState(
@@ -683,10 +764,20 @@ async def _lifespan(app: FastAPI):
         control_thread=None,
         last_control_error=None,
         command_timeout_s=timeout_s,
+        control_hz=control_hz,
+        control_mode=control_mode,
+        control_deadband_rad=deadband,
+        relative_dynamics=rdf,
+        vel_gain=vel_gain,
+        vel_clamp=vel_clamp,
+        vel_watchdog_ms=vel_watchdog_ms,
     )
     app.state.franky_state = st
+    LOG.info("franky_service: mode=%s @ %d Hz, deadband %.4f rad, relative_dynamics (v,a,j)=%s, "
+             "vel(gain=%.2f clamp=%.2f watchdog=%dms), command_timeout %.2fs",
+             control_mode, control_hz, deadband, rdf, vel_gain, vel_clamp, vel_watchdog_ms, timeout_s)
     st.robot = franky.Robot(robot_ip)
-    st.robot.relative_dynamics_factor = franky.RelativeDynamicsFactor(0.3, 0.2, 0.1)
+    st.robot.relative_dynamics_factor = franky.RelativeDynamicsFactor(*rdf)
 
 
     # Start background control thread (single uvicorn worker).
@@ -742,6 +833,13 @@ def health(request: Request):
         "stop_latched": current_app_state.stop_latched,
         "has_target": current_app_state.latest_target is not None,
         "last_control_error": current_app_state.last_control_error,
+        "control_hz": current_app_state.control_hz,
+        "control_mode": current_app_state.control_mode,
+        "control_deadband_rad": current_app_state.control_deadband_rad,
+        "relative_dynamics": list(current_app_state.relative_dynamics),
+        "vel_gain": current_app_state.vel_gain,
+        "vel_clamp": current_app_state.vel_clamp,
+        "vel_watchdog_ms": current_app_state.vel_watchdog_ms,
     }
 
 

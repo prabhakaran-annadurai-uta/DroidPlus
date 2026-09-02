@@ -126,6 +126,12 @@ class GripperClient:
                     self._async_last_error = None
             except Exception as e:
                 print(f"gripper thread movement rejected {type(e).__name__} : {e}\n")
+                # Clear the libfranka error latch so the next command is accepted.
+                try:
+                    if self.gripper is not None:
+                        self.gripper.stop()
+                except Exception:
+                    pass
                 with self._async_lock:
                     self._async_last_status_code = 500
                     self._async_last_error = f"{type(e).__name__}: {repr(e)}"
@@ -173,21 +179,31 @@ class GripperClient:
         g = self._require_gripper()
         self._async_submit(g.open, (self._speed_ms(speed),))
 
+    # epsilon_outer wide enough that clamping onto any object (rather than
+    # closing fully to 0 m) still counts as a successful grasp and holds force.
+    _GRASP_EPS_INNER = 0.005
+    _GRASP_EPS_OUTER = 0.08
+
     def close(self, *, speed: int = 255, force: int = 255, wait: bool = True) -> dict[str, Any]:
         g = self._require_gripper()
         s_ms = self._speed_ms(speed)
         f_n = self._force_n(force)
+        eps = (self._GRASP_EPS_INNER, self._GRASP_EPS_OUTER)
 
         if not wait:
-            self._async_submit(g.grasp, (0.0, s_ms, f_n))
+            self._async_submit(g.grasp, (0.0, s_ms, f_n) + eps)
             return {"ok": True, "position": 255, "object_detected": False, "accepted": True}
-            
-        success = g.grasp(0.0, s_ms, f_n)
+
+        success = g.grasp(0.0, s_ms, f_n, *eps)
         return {"ok": True, "position": self.position()["position"], "object_detected": success, "accepted": False}
 
     def close_async(self, *, speed: int = 255, force: int = 255, wait: bool = False) -> None:
         g = self._require_gripper()
-        self._async_submit(g.grasp, (0.0, self._speed_ms(speed), self._force_n(force)))
+        self._async_submit(
+            g.grasp,
+            (0.0, self._speed_ms(speed), self._force_n(force),
+             self._GRASP_EPS_INNER, self._GRASP_EPS_OUTER),
+        )
 
     def go_to(self, position: int, *, speed: int = 255, force: int = 255, wait: bool = True) -> dict[str, Any]:
         g = self._require_gripper()
