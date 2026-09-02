@@ -76,8 +76,16 @@ def run_teleop_episode(
 
     seq = 0
     rec_seq = 0
-    last_gripper_pos: int | None = None
     last_gripper_cmd_frac: float = 0.0
+
+    # Franka Hand can't be streamed a continuous width like a Robotiq — every
+    # move()/grasp() is a discrete command that libfranka rejects while another
+    # is running, and move() throws once the fingers hit an object. So drive it
+    # with an open/close *intent* latched through a hysteresis band: one command
+    # per gesture, grasp() (force-controlled) for closing, move() for opening.
+    GRIPPER_CLOSE_ON = 0.60   # leader closed-fraction that latches a grasp
+    GRIPPER_OPEN_ON = 0.40    # leader closed-fraction that latches an open
+    gripper_intent: str | None = None  # "open" | "close"
 
     # Seed the safety fallback from where the robot actually is: enforce_min_z
     # reverts to this pose, so a stale value would command a large step.
@@ -114,17 +122,27 @@ def run_teleop_episode(
             if not session.dry_run:
                 droid.set_target_joint_state(q_franka, velocities=[0.0] * 7, seq=seq)
 
-            # Gripper — continuous mapping with a bits-delta gate to avoid spam.
+            # Gripper — latch an open/close intent and fire one command per flip.
             gripper_cmd_frac = last_gripper_cmd_frac
             if gripper_initialized and not session.dry_run and command.gripper_bits is not None:
-                robotiq_pos = int(command.gripper_bits)
-                gripper_cmd_frac = float(robotiq_pos) / 255.0
-                if last_gripper_pos is None or abs(robotiq_pos - last_gripper_pos) > 2:
+                close_frac = float(command.gripper_bits) / 255.0  # 0 = open, 1 = closed
+                gripper_cmd_frac = close_frac
+
+                desired = gripper_intent
+                if close_frac >= GRIPPER_CLOSE_ON:
+                    desired = "close"
+                elif close_frac <= GRIPPER_OPEN_ON:
+                    desired = "open"
+
+                if desired is not None and desired != gripper_intent:
                     try:
-                        droid.gripper.go_to_async(robotiq_pos, wait=False)
-                        last_gripper_pos = robotiq_pos
-                    except Exception:
-                        pass
+                        if desired == "close":
+                            droid.gripper.close_async(wait=False)
+                        else:
+                            droid.gripper.open_async(wait=False)
+                        gripper_intent = desired
+                    except Exception as e:
+                        print(f"[gripper] {type(e).__name__}: {e}")
                 last_gripper_cmd_frac = gripper_cmd_frac
 
             # Sub-rate recording.
