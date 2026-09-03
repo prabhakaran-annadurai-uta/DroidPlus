@@ -79,8 +79,8 @@ DEFAULT_SERVICE_PORT = 54321
 EFFECTIVE_FLOAT_INF_SECONDS = 1_000_000 # This is about 2 weeks
 
 # Joint-space \"home\" pose (matches `franky_client.HOME_POSITION`).
-HOME_POSITION: list[float] = [0.0, -0.40, 0.0, -1.9, 0.0, 1.5, 0.0]
-
+#HOME_POSITION: list[float] = [0.0, -0.40, 0.0, -1.9, 0.0, 1.5, 0.0]
+HOME_POSITION: list[float] = [0.0, 0.0, 0.0, -1.571, 0.0, 1.571, 0.0]
 
 LANDING_PAGE_HTML = """<!doctype html>
 <html lang="en">
