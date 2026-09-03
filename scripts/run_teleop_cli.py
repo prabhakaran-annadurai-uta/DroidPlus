@@ -57,6 +57,25 @@ _YELLOW = "\033[93m"
 _RESET = "\033[0m"
 
 
+def _home_and_drop(droid: DroidPlus, *, drop: bool) -> None:
+    """Send the arm to its home pose and release the held object (open the gripper).
+
+    Runs entirely between episodes, from the teleop process that owns the gripper
+    connection -- do NOT trigger a gripper open from franky_service while teleop is up.
+    """
+    try:
+        droid.go_home()
+        print(f"{_CYAN}Home: arm moving to home pose.{_RESET}")
+    except Exception as e:
+        print(f"{_YELLOW}Home failed: {type(e).__name__}: {e}{_RESET}")
+    if drop:
+        try:
+            droid.gripper.open()  # blocking; we're in dead time between episodes
+            print(f"{_CYAN}Home: gripper opened (object released).{_RESET}")
+        except Exception as e:
+            print(f"{_YELLOW}Gripper open failed: {type(e).__name__}: {e}{_RESET}")
+
+
 def _make_cli_should_stop(keys: KeyPoller, stop_flag: list[bool]) -> Callable[[], bool]:
     """ESC (during episode) or Ctrl+C (via stop_flag) ends the episode."""
     def should_stop() -> bool:
@@ -176,7 +195,7 @@ def main() -> None:
             # Wait for SPACE when interactive.
             if sys.stdin.isatty():
                 print(f"\n{_CYAN}Press SPACE to start episode {episode_idx}, "
-                      f"ESC to quit, Ctrl+C to quit.{_RESET}")
+                      f"H to home + drop object, ESC/Ctrl+C to quit.{_RESET}")
                 while not stop_flag[0]:
                     ch = keys.poll_char()
                     if ch is None:
@@ -185,6 +204,9 @@ def main() -> None:
                     if ch == "\x1b":
                         stop_flag[0] = True
                         break
+                    if ch in ("h", "H"):
+                        _home_and_drop(droid, drop=gripper_initialized and not args.dry_run)
+                        continue
                     if ch == " ":
                         break
                 if stop_flag[0]:

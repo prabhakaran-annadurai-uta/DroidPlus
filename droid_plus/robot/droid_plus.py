@@ -126,6 +126,10 @@ class DroidPlus:
     def stop(self) -> dict[str, Any]:
         return self.robot.stop()
 
+    def go_home(self) -> dict[str, Any]:
+        """Drive to the service's HOME_POSITION (same as the franky_service UI 'Go home')."""
+        return self.robot.go_home()
+
     def set_target_joint_state(
         self,
         positions: Any,

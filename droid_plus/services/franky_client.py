@@ -45,6 +45,12 @@ class FrankyClient:
         r.raise_for_status()
         return r.json()
 
+    def go_home(self) -> dict[str, Any]:
+        """Ask the service to drive to its HOME_POSITION (same as the landing-page button)."""
+        r = requests.post(self._url("/go_home"), timeout=self.timeout_s)
+        r.raise_for_status()
+        return r.json()
+
     def set_target_joint_state(
         self,
         positions: Any,
