@@ -315,12 +315,16 @@ def _image_stats(
     """Per-channel stats sampled over a few frames; channel order = RGB.
 
     Pixel values are normalized to [0, 1] to match LeRobot conventions.
+    Per-channel stats keep shape (3, 1, 1), matching the shape LeRobot's own
+    stats validator expects for image/video features (see
+    ``lerobot.datasets.compute_stats._validate_stat_value``); a flat (3,)
+    list fails that validator during v2.1 -> v3.0 conversion.
     """
     import cv2
 
     n = len(frame_paths)
     if n == 0:
-        zeros3 = [0.0, 0.0, 0.0]
+        zeros3 = [[[0.0]], [[0.0]], [[0.0]]]
         return {"mean": zeros3, "std": zeros3, "min": zeros3, "max": zeros3, "count": [0]}
 
     sample = max(1, min(sample, n))
@@ -349,7 +353,7 @@ def _image_stats(
         counts += flat.shape[0]
 
     if not means:
-        zeros3 = [0.0, 0.0, 0.0]
+        zeros3 = [[[0.0]], [[0.0]], [[0.0]]]
         return {"mean": zeros3, "std": zeros3, "min": zeros3, "max": zeros3, "count": [0]}
 
     mean = np.mean(np.stack(means, axis=0), axis=0)
@@ -359,11 +363,13 @@ def _image_stats(
     mn = np.min(np.stack(mins, axis=0), axis=0)
     mx = np.max(np.stack(maxs, axis=0), axis=0)
 
+    # Reshape (3,) -> (3, 1, 1): LeRobot's stats validator requires image/video
+    # feature stats to keep per-channel spatial dims (see docstring above).
     return {
-        "mean": mean.tolist(),
-        "std": std.tolist(),
-        "min": mn.tolist(),
-        "max": mx.tolist(),
+        "mean": mean.reshape(3, 1, 1).tolist(),
+        "std": std.reshape(3, 1, 1).tolist(),
+        "min": mn.reshape(3, 1, 1).tolist(),
+        "max": mx.reshape(3, 1, 1).tolist(),
         "count": [int(counts)],
     }
 
@@ -403,10 +409,16 @@ def _aggregate_global_stats(per_episode: list[dict[str, dict[str, list[float]]]]
         if not counts:
             continue
 
+        stacked_means = np.stack(means, axis=0)
+        stacked_sq_means = np.stack(sq_means, axis=0)
+
         w = np.asarray(counts, dtype=np.float64)
         w = w / w.sum()
-        agg_mean = np.sum(np.stack(means, axis=0) * w[:, None], axis=0)
-        agg_sq = np.sum(np.stack(sq_means, axis=0) * w[:, None], axis=0)
+        # Broadcast weights against feature stats of any rank (e.g. (3,1,1) for
+        # image/video channel stats, not just 1-D joint/action vectors).
+        w = w.reshape((-1,) + (1,) * (stacked_means.ndim - 1))
+        agg_mean = np.sum(stacked_means * w, axis=0)
+        agg_sq = np.sum(stacked_sq_means * w, axis=0)
         agg_var = np.maximum(agg_sq - agg_mean ** 2, 0.0)
         agg_std = np.sqrt(agg_var)
         agg_min = np.min(np.stack(mins, axis=0), axis=0)
