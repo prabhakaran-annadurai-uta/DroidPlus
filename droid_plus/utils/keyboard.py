@@ -120,6 +120,26 @@ def prompt_success(keys: KeyPoller) -> bool | None:
             return None
 
 
+def prompt_redo(keys: KeyPoller) -> bool:
+    """Ask whether to discard the just-recorded episode and redo it.
+
+    Returns ``True`` to discard + re-record under the same episode index,
+    ``False`` to keep it (default on Enter).
+    """
+    print(f"{_BOLD}keep this episode?{_RESET} [enter=keep / r=discard & redo]: ", end="", flush=True)
+    while True:
+        ch = keys.poll_char()
+        if ch is None:
+            time.sleep(0.02)
+            continue
+        if ch.lower() == "r":
+            print("discard & redo")
+            return True
+        if ch in ("\r", "\n"):
+            print("keep")
+            return False
+
+
 def prompt_score(keys: KeyPoller) -> float | None:
     """Prompt for numeric score. Temporarily restores normal terminal mode."""
     if keys._fd is not None and keys._old is not None:

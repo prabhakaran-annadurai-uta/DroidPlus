@@ -6,11 +6,21 @@ CLI teleop runner — a leader arm streams to the Franka, with recording.
 
 Supported leaders: ``so101`` (LeRobot SO-101) and ``gello`` (7-DoF GELLO).
 
-Multi-episode loop: SPACE to start, ESC to stop, then post-episode prompts
-(valid/success/score/notes). Records by default; pass --no-record to disable.
+Multi-episode loop: SPACE to start, ESC to stop, then a keep/discard prompt
+(r = discard the run and re-record it under the same episode index) followed
+by the post-episode labels (valid/success/score/notes). Records by default;
+pass --no-record to disable.
+
+Between episodes: T streams the leader to the robot without recording so you
+can reposition the object for the next take (SPACE/ESC to end), H homes the
+arm and drops the object.
+
+With --lift-stop-height, an episode ends automatically once the grasped object
+is lifted that far above the table (the --min-z floor).
 
 Usage:
     python scripts/run_teleop_cli.py
+    python scripts/run_teleop_cli.py --lift-stop-height 0.10
     python scripts/run_teleop_cli.py --leader gello
     python scripts/run_teleop_cli.py --leader gello --port /dev/ttyUSB0 --gello-config gello_config.json
     python scripts/run_teleop_cli.py --port /dev/ttyACM1 --no-gripper
@@ -20,9 +30,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shutil
 import signal
 import sys
 import time
+from dataclasses import replace
 from typing import Any, Callable
 
 from droid_plus.analysis.end_effector_pose import compute_and_save_ee_trajectory_single
@@ -46,6 +58,7 @@ from droid_plus.logging import EpisodeRecorder
 from droid_plus.robot import DroidPlus
 from droid_plus.utils import (
     KeyPoller,
+    prompt_redo,
     prompt_score,
     prompt_success,
     prompt_text,
@@ -74,6 +87,48 @@ def _home_and_drop(droid: DroidPlus, *, drop: bool) -> None:
             print(f"{_CYAN}Home: gripper opened (object released).{_RESET}")
         except Exception as e:
             print(f"{_YELLOW}Gripper open failed: {type(e).__name__}: {e}{_RESET}")
+
+
+def _free_teleop(
+    *,
+    droid: DroidPlus,
+    leader: Any,
+    session: TeleopSessionConfig,
+    gripper_initialized: bool,
+    pin_model: Any,
+    pin_data: Any,
+    ee_frame: str,
+    keys: KeyPoller,
+    stop_flag: list[bool],
+) -> None:
+    """Stream the leader to the robot with no recording — used between episodes
+    to reposition the object (or the arm) for the next take.
+
+    SPACE or ESC returns to the episode prompt; Ctrl+C quits the session.
+    """
+    print(f"{_CYAN}Free teleop (NOT recording) — move the object, then SPACE/ESC to stop.{_RESET}")
+
+    def _should_stop() -> bool:
+        if stop_flag[0]:
+            return True
+        ch = keys.poll_char()
+        return ch in (" ", "\x1b")
+
+    # Reuse the episode runner without a recorder; drop the lift auto-stop so
+    # raising the arm to reposition doesn't cut it short.
+    run_teleop_episode(
+        config=EpisodeConfig(),
+        session=replace(session, lift_stop_height=0.0),
+        droid=droid,
+        leader=leader,
+        gripper_initialized=gripper_initialized,
+        pin_model=pin_model,
+        pin_data=pin_data,
+        ee_frame=ee_frame,
+        recorder=None,
+        should_stop=_should_stop,
+    )
+    print(f"{_CYAN}Free teleop stopped.{_RESET}")
 
 
 def _make_cli_should_stop(keys: KeyPoller, stop_flag: list[bool]) -> Callable[[], bool]:
@@ -110,6 +165,24 @@ def main() -> None:
     parser.add_argument("--rate-hz", type=float, default=100.0, help="Control loop rate (Hz)")
     parser.add_argument("--min-z", type=float, default=DEFAULT_MIN_EE_Z,
         help=f"Minimum EE Z height (m) — table safety threshold (default: {DEFAULT_MIN_EE_Z})")
+    parser.add_argument("--lift-stop-height", type=float, default=0.0,
+        help="Auto-stop the episode once the EE lifts this many metres above --min-z "
+             "(e.g. 0.10 for 10 cm). 0 disables (default).")
+    parser.add_argument("--no-lift-require-grasp", action="store_true",
+        help="With --lift-stop-height, trigger on EE height alone rather than "
+             "requiring a latched force-grasp.")
+    parser.add_argument("--grasp-force", type=int, default=160,
+        help="Force the latched grasp holds, in bits (255 ~ 50 N ceiling; "
+             "default 160 ~ 31 N). Lower for deformable objects.")
+    parser.add_argument("--grasp-speed", type=int, default=128,
+        help="Grasp closing speed in bits (255 ~ 0.1 m/s; default 128 ~ 0.05 m/s).")
+    parser.add_argument("--grasp-width", type=float, default=0.0,
+        help="Grasp to this object width in metres, e.g. 0.045. Recommended: a "
+             "grasp(0.0) 'squeeze' often reports failure and releases on a thick "
+             "object. 0 = legacy squeeze-shut.")
+    parser.add_argument("--grasp-epsilon", type=float, default=0.01,
+        help="Success-band half-width (m) around --grasp-width (default 0.01). "
+             "Ignored when --grasp-width is 0.")
     parser.add_argument("--no-record", action="store_true", help="Disable data recording")
     parser.add_argument("--record-rate-hz", type=float, default=15.0,
         help="Recording rate (images + state/action captured at this rate)")
@@ -130,6 +203,12 @@ def main() -> None:
         record_rate_hz=float(args.record_rate_hz),
         record_jpeg_quality=int(args.record_jpeg_quality),
         min_z=float(args.min_z),
+        lift_stop_height=float(args.lift_stop_height),
+        lift_stop_require_grasp=not args.no_lift_require_grasp,
+        grasp_force_bits=int(args.grasp_force),
+        grasp_speed_bits=int(args.grasp_speed),
+        grasp_width_m=float(args.grasp_width),
+        grasp_epsilon_m=float(args.grasp_epsilon),
         dry_run=bool(args.dry_run),
         record=bool(record),
         policy_name=f"teleop_{args.leader}",
@@ -174,6 +253,18 @@ def main() -> None:
               f"(~{session.rate_hz / record_every_n:.1f} Hz)")
 
     print(f"Leader: {args.leader} on {leader_port}")
+    if session.grasp_width_m > 0.0:
+        print(f"Grasp: width {session.grasp_width_m * 1000:.0f} mm "
+              f"(+/-{session.grasp_epsilon_m * 1000:.0f} mm), "
+              f"{session.grasp_force_bits} bits (~{session.grasp_force_bits / 255 * 50:.0f} N)")
+    else:
+        print(f"{_YELLOW}Grasp: width 0 (squeeze) — pass --grasp-width <object width, e.g. 0.045> "
+              f"for a firm hold. force {session.grasp_force_bits} bits "
+              f"(~{session.grasp_force_bits / 255 * 50:.0f} N){_RESET}")
+    if session.lift_stop_height > 0.0:
+        gate = "grasp + height" if session.lift_stop_require_grasp else "height only"
+        print(f"Lift auto-stop: EE > min_z + {session.lift_stop_height:.2f} m "
+              f"(z >= {session.min_z + session.lift_stop_height:.3f} m), {gate}")
 
     # ── Stop flag for SIGINT/SIGTERM ─────────────────────────────────────
     stop_flag: list[bool] = [False]
@@ -194,8 +285,11 @@ def main() -> None:
         while not stop_flag[0]:
             # Wait for SPACE when interactive.
             if sys.stdin.isatty():
-                print(f"\n{_CYAN}Press SPACE to start episode {episode_idx}, "
-                      f"H to home + drop object, ESC/Ctrl+C to quit.{_RESET}")
+                def _print_prompt() -> None:
+                    print(f"\n{_CYAN}Press SPACE to start episode {episode_idx}, "
+                          f"T to teleop (no recording) and reposition the object, "
+                          f"H to home + drop object, ESC/Ctrl+C to quit.{_RESET}")
+                _print_prompt()
                 while not stop_flag[0]:
                     ch = keys.poll_char()
                     if ch is None:
@@ -206,6 +300,24 @@ def main() -> None:
                         break
                     if ch in ("h", "H"):
                         _home_and_drop(droid, drop=gripper_initialized and not args.dry_run)
+                        _print_prompt()
+                        continue
+                    if ch in ("t", "T"):
+                        if args.dry_run:
+                            print(f"{_YELLOW}Free teleop unavailable in --dry-run.{_RESET}")
+                        else:
+                            _free_teleop(
+                                droid=droid,
+                                leader=leader,
+                                session=session,
+                                gripper_initialized=gripper_initialized,
+                                pin_model=pin_model,
+                                pin_data=pin_data,
+                                ee_frame=ee_frame,
+                                keys=keys,
+                                stop_flag=stop_flag,
+                            )
+                        _print_prompt()
                         continue
                     if ch == " ":
                         break
@@ -253,8 +365,30 @@ def main() -> None:
             )
 
             duration = result.t_end - result.t_start
-            print(f"\n{_YELLOW}Episode {episode_idx} ended: {result.seq} recorded steps, "
+            reason = (
+                "lift auto-stop" if result.stopped_by_lift
+                else "step limit" if result.stopped_by_limit
+                else "stopped by user"
+            )
+            print(f"\n{_YELLOW}Episode {episode_idx} ended ({reason}): {result.seq} recorded steps, "
                   f"{duration:.1f}s{_RESET}")
+            if result.stopped_by_lift:
+                print(f"{_CYAN}Recording stopped — object lifted. "
+                      f"Place it back on the table before the next episode.{_RESET}")
+
+            # Offer to discard a bad run and re-record it under the same index.
+            if sys.stdin.isatty() and prompt_redo(keys):
+                if result.recorder is not None:
+                    ep_dir = result.recorder.episode_dir
+                    result.recorder.close()
+                    try:
+                        shutil.rmtree(ep_dir)
+                        print(f"{_YELLOW}Discarded {ep_dir} — re-recording episode {episode_idx}.{_RESET}")
+                    except Exception as e:
+                        print(f"{_YELLOW}Failed to remove {ep_dir}: {e}{_RESET}")
+                else:
+                    print(f"{_YELLOW}Discarded — re-running episode {episode_idx}.{_RESET}")
+                continue  # episode_idx not incremented (press H to home + drop)
 
             # Post-episode labels.
             episode_valid: bool | None = None

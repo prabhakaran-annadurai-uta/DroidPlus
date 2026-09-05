@@ -184,25 +184,53 @@ class GripperClient:
     _GRASP_EPS_INNER = 0.005
     _GRASP_EPS_OUTER = 0.08
 
-    def close(self, *, speed: int = 255, force: int = 255, wait: bool = True) -> dict[str, Any]:
+    def _grasp_args(
+        self,
+        speed: int,
+        force: int,
+        width_m: float,
+        epsilon_inner: float | None,
+        epsilon_outer: float | None,
+    ) -> tuple[float, float, float, float, float]:
+        w = float(max(0.0, min(self._max_width_m, width_m)))
+        ei = self._GRASP_EPS_INNER if epsilon_inner is None else float(epsilon_inner)
+        eo = self._GRASP_EPS_OUTER if epsilon_outer is None else float(epsilon_outer)
+        return (w, self._speed_ms(speed), self._force_n(force), ei, eo)
+
+    def close(
+        self,
+        *,
+        speed: int = 255,
+        force: int = 255,
+        wait: bool = True,
+        width_m: float = 0.0,
+        epsilon_inner: float | None = None,
+        epsilon_outer: float | None = None,
+    ) -> dict[str, Any]:
         g = self._require_gripper()
-        s_ms = self._speed_ms(speed)
-        f_n = self._force_n(force)
-        eps = (self._GRASP_EPS_INNER, self._GRASP_EPS_OUTER)
+        args = self._grasp_args(speed, force, width_m, epsilon_inner, epsilon_outer)
 
         if not wait:
-            self._async_submit(g.grasp, (0.0, s_ms, f_n) + eps)
+            self._async_submit(g.grasp, args)
             return {"ok": True, "position": 255, "object_detected": False, "accepted": True}
 
-        success = g.grasp(0.0, s_ms, f_n, *eps)
+        success = g.grasp(*args)
         return {"ok": True, "position": self.position()["position"], "object_detected": success, "accepted": False}
 
-    def close_async(self, *, speed: int = 255, force: int = 255, wait: bool = False) -> None:
+    def close_async(
+        self,
+        *,
+        speed: int = 255,
+        force: int = 255,
+        wait: bool = False,
+        width_m: float = 0.0,
+        epsilon_inner: float | None = None,
+        epsilon_outer: float | None = None,
+    ) -> None:
         g = self._require_gripper()
         self._async_submit(
             g.grasp,
-            (0.0, self._speed_ms(speed), self._force_n(force),
-             self._GRASP_EPS_INNER, self._GRASP_EPS_OUTER),
+            self._grasp_args(speed, force, width_m, epsilon_inner, epsilon_outer),
         )
 
     def go_to(self, position: int, *, speed: int = 255, force: int = 255, wait: bool = True) -> dict[str, Any]:

@@ -13,6 +13,7 @@ from droid_plus.utils.geometry import (
 )
 from droid_plus.utils.keyboard import (
     KeyPoller,
+    prompt_redo,
     prompt_score,
     prompt_success,
     prompt_text,
@@ -27,6 +28,7 @@ __all__ = [
     "prompt_success",
     "prompt_score",
     "prompt_text",
+    "prompt_redo",
     "load_experiment",
     "load_experiments_file",
     "RateLimiter",

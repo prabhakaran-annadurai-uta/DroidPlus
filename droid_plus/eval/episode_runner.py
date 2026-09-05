@@ -48,6 +48,7 @@ class EpisodeResult:
     recorder: EpisodeRecorder | None  # un-finalized; caller finalizes after labeling
     stopped_by_limit: bool
     stopped_by_caller: bool           # should_stop() returned True
+    stopped_by_lift: bool = False     # teleop: EE lifted above the auto-stop height
 
 
 @dataclass(frozen=True)

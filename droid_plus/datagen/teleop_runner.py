@@ -47,6 +47,22 @@ class TeleopSessionConfig:
     dry_run: bool = False
     record: bool = True
     policy_name: str = "teleop_so101"
+    # Auto-stop: end the episode once the EE lifts this many metres above
+    # ``min_z`` (0 disables). Intended for pick tasks — lifting the grasped
+    # object clear of the table ends the demo. ``lift_stop_require_grasp``
+    # additionally gates it on a latched force-grasp so raising an empty arm
+    # to reposition does not trip it.
+    lift_stop_height: float = 0.0
+    lift_stop_require_grasp: bool = True
+    # Latched grasp() parameters. ``grasp_width_m`` is the target finger gap:
+    # libfranka only *holds* force when the final width lands inside
+    # ``[width - eps, width + eps]``, and a ``grasp(0.0)`` on a thick object
+    # frequently reports failure and releases. Set ``grasp_width_m`` to the
+    # object width for a firm hold; 0.0 keeps the legacy "squeeze fully" call.
+    grasp_force_bits: int = 150          # 255 -> ~50 N (GripperClient ceiling)
+    grasp_speed_bits: int = 255          # 255 -> ~0.1 m/s
+    grasp_width_m: float = 0.0           # >0: grasp to this object width (metres)
+    grasp_epsilon_m: float = 0.01        # success band half-width (used when grasp_width_m > 0)
 
 
 # ── Episode runner ───────────────────────────────────────────────────────────
@@ -91,9 +107,17 @@ def run_teleop_episode(
     GRIPPER_GRASP_OFF = 0.55       # closed-fraction that drops back to move()
     GRIPPER_MOVE_DEADBAND = 0.05   # min frac change before re-sending a move()
     GRIPPER_MIN_CMD_INTERVAL_S = 0.15
-    # Grasp force, in client "bits" (255 -> ~50 N). ~90 -> ~18 N: gentle enough
-    # for a sponge without crushing it. Raise for heavier / more slippery objects.
-    GRIPPER_GRASP_FORCE_BITS = 90
+    # Latched grasp() parameters from the session.
+    grasp_force_bits = int(np.clip(session.grasp_force_bits, 0, 255))
+    grasp_speed_bits = int(np.clip(session.grasp_speed_bits, 1, 255))
+    grasp_force_n = grasp_force_bits / 255.0 * 50.0
+    grasp_width_m = max(0.0, float(session.grasp_width_m))
+    grasp_eps_kw = (
+        {"epsilon_inner": float(session.grasp_epsilon_m),
+         "epsilon_outer": float(session.grasp_epsilon_m)}
+        if grasp_width_m > 0.0
+        else {}
+    )
     gripper_grasping = False
     last_move_frac: float | None = None
     last_gripper_cmd_t = 0.0
@@ -109,6 +133,12 @@ def run_teleop_episode(
 
     _stopped_by_caller = False
     _stopped_by_limit = False
+    _stopped_by_lift = False
+    lift_stop_z = (
+        session.min_z + session.lift_stop_height
+        if session.lift_stop_height > 0.0
+        else None
+    )
     t_episode_start = time.time()
 
     try:
@@ -125,10 +155,24 @@ def run_teleop_episode(
             command = leader.read()
             q_franka = np.asarray(command.q_franka, dtype=float)
 
-            q_franka, _ = enforce_min_z(
+            q_franka, ee_z = enforce_min_z(
                 q_franka, q_prev_safe, pin_model, pin_data, ee_frame, session.min_z,
             )
             q_prev_safe = q_franka.copy()
+
+            # Auto-stop once a grasped object is lifted clear of the table.
+            if (
+                lift_stop_z is not None
+                and not session.dry_run
+                and ee_z >= lift_stop_z
+                and (not session.lift_stop_require_grasp or gripper_grasping)
+            ):
+                print(
+                    f"[lift-stop] EE z={ee_z:.3f}m >= {lift_stop_z:.3f}m "
+                    f"(min_z + {session.lift_stop_height:.2f}m) — recording stopped."
+                )
+                _stopped_by_lift = True
+                break
 
             if not session.dry_run:
                 droid.set_target_joint_state(q_franka, velocities=[0.0] * 7, seq=seq)
@@ -141,15 +185,25 @@ def run_teleop_episode(
 
                 if not gripper_grasping and close_frac >= GRIPPER_GRASP_ON:
                     try:
-                        droid.gripper.close_async(force=GRIPPER_GRASP_FORCE_BITS, wait=False)
+                        droid.gripper.close_async(
+                            force=grasp_force_bits,
+                            speed=grasp_speed_bits,
+                            width_m=grasp_width_m,
+                            wait=False,
+                            **grasp_eps_kw,
+                        )
                         gripper_grasping = True
                         last_move_frac = None
                         last_gripper_cmd_t = t0
+                        _w = f"{grasp_width_m*1000:.0f} mm" if grasp_width_m > 0 else "0 (squeeze)"
+                        print(f"[gripper] grasp latched (width={_w}, "
+                              f"force={grasp_force_bits} bits ~ {grasp_force_n:.0f} N)")
                     except Exception as e:
                         print(f"[gripper] {type(e).__name__}: {e}")
                 elif gripper_grasping and close_frac <= GRIPPER_GRASP_OFF:
                     gripper_grasping = False
                     last_move_frac = None  # reposition on the next eligible tick
+                    print("[gripper] grasp released -> move mode")
 
                 if not gripper_grasping:
                     move_frac = min(close_frac / GRIPPER_GRASP_OFF, 1.0)
@@ -227,6 +281,7 @@ def run_teleop_episode(
         recorder=recorder,
         stopped_by_limit=_stopped_by_limit,
         stopped_by_caller=_stopped_by_caller,
+        stopped_by_lift=_stopped_by_lift,
     )
 
 
@@ -261,6 +316,12 @@ def finalize_teleop_episode_recording(
                 "record_rate_hz": session.record_rate_hz,
                 "min_z": session.min_z,
                 "action_step_limit": config.action_step_limit,
+                "lift_stop_height": session.lift_stop_height,
+                "stopped_by_lift": result.stopped_by_lift,
+                "grasp_force_bits": session.grasp_force_bits,
+                "grasp_speed_bits": session.grasp_speed_bits,
+                "grasp_width_m": session.grasp_width_m,
+                "grasp_epsilon_m": session.grasp_epsilon_m,
             },
             extra_meta={
                 "valid": episode_valid,
