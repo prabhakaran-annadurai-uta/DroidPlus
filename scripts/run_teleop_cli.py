@@ -12,8 +12,9 @@ by the post-episode labels (valid/success/score/notes). Records by default;
 pass --no-record to disable.
 
 Between episodes: T streams the leader to the robot without recording so you
-can reposition the object for the next take (SPACE/ESC to end), H homes the
-arm and drops the object.
+can reposition the object for the next take (SPACE/ESC to end), O opens the
+gripper in place (drops the object, arm stays put), H homes the arm and drops
+the object.
 
 With --lift-stop-height, an episode ends automatically once the grasped object
 is lifted that far above the table (the --min-z floor).
@@ -87,6 +88,19 @@ def _home_and_drop(droid: DroidPlus, *, drop: bool) -> None:
             print(f"{_CYAN}Home: gripper opened (object released).{_RESET}")
         except Exception as e:
             print(f"{_YELLOW}Gripper open failed: {type(e).__name__}: {e}{_RESET}")
+
+
+def _open_gripper(droid: DroidPlus) -> None:
+    """Open the gripper in place (release the held object) without homing the arm.
+
+    Runs entirely between episodes, from the teleop process that owns the gripper
+    connection -- do NOT trigger a gripper open from franky_service while teleop is up.
+    """
+    try:
+        droid.gripper.open()  # blocking; we're in dead time between episodes
+        print(f"{_CYAN}Gripper opened (object released).{_RESET}")
+    except Exception as e:
+        print(f"{_YELLOW}Gripper open failed: {type(e).__name__}: {e}{_RESET}")
 
 
 def _free_teleop(
@@ -288,6 +302,7 @@ def main() -> None:
                 def _print_prompt() -> None:
                     print(f"\n{_CYAN}Press SPACE to start episode {episode_idx}, "
                           f"T to teleop (no recording) and reposition the object, "
+                          f"O to open the gripper (drop object, arm stays put), "
                           f"H to home + drop object, ESC/Ctrl+C to quit.{_RESET}")
                 _print_prompt()
                 while not stop_flag[0]:
@@ -298,6 +313,14 @@ def main() -> None:
                     if ch == "\x1b":
                         stop_flag[0] = True
                         break
+                    if ch in ("o", "O"):
+                        if gripper_initialized and not args.dry_run:
+                            _open_gripper(droid)
+                        else:
+                            reason = "dry-run" if args.dry_run else "gripper not initialized"
+                            print(f"{_YELLOW}Open gripper unavailable ({reason}).{_RESET}")
+                        _print_prompt()
+                        continue
                     if ch in ("h", "H"):
                         _home_and_drop(droid, drop=gripper_initialized and not args.dry_run)
                         _print_prompt()
